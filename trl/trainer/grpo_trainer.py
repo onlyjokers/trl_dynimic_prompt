@@ -697,6 +697,13 @@ class GRPOTrainer(Trainer):
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
 
+        # 支持动态 prompt 调整函数
+        self.dynamic_prompts_fn = args.dynamic_prompts_fn if hasattr(args, 'dynamic_prompts_fn') else None
+        # 存储上一次生成所用的 prompts, completions, rewards
+        self.last_prompts = None
+        self.last_completions = None
+        self.last_rewards = None
+
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 if self.is_deepspeed_enabled:
@@ -982,7 +989,16 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
-
+        # 动态更新 prompts: 如果用户传了函数并且已有上次记录
+        if mode == "train" and self.dynamic_prompts_fn is not None and self.last_completions is not None:
+            # 根据上次生成结果计算新的 prompts
+            metas = [{k: v for k, v in ex.items() if k != "prompt"} for ex in inputs]
+            new_prompts = self.dynamic_prompts_fn(
+                self.last_prompts, self.last_completions, self.last_rewards, metas
+            )
+            for ex, p in zip(inputs, new_prompts):
+                ex["prompt"] = p
+        # 原始 prompt 列表
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(
@@ -1187,6 +1203,12 @@ class GRPOTrainer(Trainer):
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        # 记录当前生成结果，用于下一次动态 prompt 调整
+        if self.dynamic_prompts_fn is not None:
+            self.last_prompts = prompts.copy()
+            self.last_completions = completions.copy()
+            # rewards: Tensor -> python 列表
+            self.last_rewards = rewards.detach().cpu().tolist()
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1382,6 +1404,7 @@ class GRPOTrainer(Trainer):
         is_region_clipped = is_low_clipped | is_high_clipped
 
         low_clip = (is_low_clipped * completion_mask).sum() / completion_mask.sum()
+       
         high_clip = (is_high_clipped * completion_mask).sum() / completion_mask.sum()
         clip_ratio = (is_region_clipped * completion_mask).sum() / completion_mask.sum()
 

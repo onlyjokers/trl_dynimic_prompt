@@ -44,6 +44,42 @@ trainer = GRPOTrainer(
     train_dataset=dataset,
 )
 trainer.train()
+
+## Dynamic prompt adjustment
+
+You can provide a `dynamic_prompts_fn` to `GRPOConfig` that will be called after each generation to update the prompts for the next generation based on the last prompts, completions, and rewards.
+
+Example:
+```python
+def curriculum_fn(prompts, completions, rewards, metas):
+    """
+    prompts: List[str] of original prompts
+    completions: List[str] of last generated completions
+    rewards: List[float] of last computed rewards
+    metas: List[dict] of additional input data per sample
+    """
+    new_prompts = []
+    for p, c, r in zip(prompts, completions, rewards):
+        if r < 0:
+            # low reward, add a hint
+            new_prompts.append(p + " // Hint: check your color setup in GLSL")
+        else:
+            # high reward, increase difficulty
+            new_prompts.append(p + " // Next: add moving gradient effect")
+    return new_prompts
+
+training_args = GRPOConfig(
+    output_dir="out",
+    dynamic_prompts_fn=curriculum_fn,
+)
+trainer = GRPOTrainer(
+    model="YourModel",
+    reward_funcs=your_reward_fn,
+    args=training_args,
+    train_dataset=dataset,
+)
+trainer.train()
+```
 ```
 
 Execute the script using the following command:
@@ -196,316 +232,3 @@ In this mode, vLLM runs in a separate process (and using separate GPUs) and comm
        vllm_mode="server",  # default value, can be omitted
    )
    ```
-
-<Tip warning={true}>
-
-Make sure that the server is using different GPUs than the trainer, otherwise you may run into NCCL errors. You can specify the GPUs to use with the `CUDA_VISIBLE_DEVICES` environment variable.
-
-</Tip>
-
-#### 🧩 Option 2: Colocate mode
-
-In this mode, vLLM runs inside the trainer process and shares GPU memory with the training model. This avoids launching a separate server and can improve GPU utilization, but may lead to memory contention on the training GPUs.
-
-```python
-from trl import GRPOConfig
-
-training_args = GRPOConfig(
-    ...,
-    use_vllm=True,
-    vllm_mode="colocate",
-)
-```
-
-<Tip>
-
-Depending on the model size and the overall GPU memory requirements for training, you may need to adjust the `vllm_gpu_memory_utilization` parameter in [`GRPOConfig`] to avoid underutilization or out-of-memory errors.
-
-</Tip>
-
-For more information, see [Speeding up training with vLLM](speeding_up_training#vllm-for-fast-generation-in-online-methods).
-
-### GRPO at scale: train a 70B+ Model on multiple nodes
-
-When training large models like **Qwen2.5-72B**, you need several key optimizations to make the training efficient and scalable across multiple GPUs and nodes. These include:
-
-- **DeepSpeed ZeRO Stage 3**: ZeRO leverages data parallelism to distribute model states (weights, gradients, optimizer states) across multiple GPUs and CPUs, reducing memory and compute requirements on each device. Since large models cannot fit on a single GPU, using ZeRO Stage 3 is required for training such model. For more details, see [DeepSpeed Integration](deepspeed_integration).
-- **Accelerate**: Accelerate is a library that simplifies distributed training across multiple GPUs and nodes. It provides a simple API to launch distributed training and handles the complexities of distributed training, such as data parallelism, gradient accumulation, and distributed data loading. For more details, see [Distributing Training](distributing_training).
-- **vLLM**: See the previous section on how to use vLLM to speed up generation.
-
-Below is an example SLURM script to train a 70B model with GRPO on multiple nodes. This script trains a model on 4 nodes and uses the 5th node for vLLM-powered generation.
-
-```sh
-#!/bin/bash
-#SBATCH --nodes=5
-#SBATCH --gres=gpu:8
-
-# Get the list of allocated nodes
-NODELIST=($(scontrol show hostnames $SLURM_JOB_NODELIST))
-
-# Assign the first 4 nodes for training and the 5th node for vLLM
-TRAIN_NODES="${NODELIST[@]:0:4}"  # Nodes 0, 1, 2, 3 for training
-VLLM_NODE="${NODELIST[4]}"  # Node 4 for vLLM
-
-# Run training on the first 4 nodes (Group 1)
-srun --nodes=4 --ntasks=4 --nodelist="${NODELIST[@]:0:4}" accelerate launch \
-     --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
-     --num_processes 32 \
-     --num_machines 4 \
-     --main_process_ip ${NODELIST[0]} \
-     --machine_rank $SLURM_PROCID \
-     --rdzv_backend c10d \
-     train_grpo.py \
-     --server_ip $VLLM_NODE &
-
-# Run vLLM server on the 5th node (Group 2)
-srun --nodes=1 --ntasks=1 --nodelist="${NODELIST[4]}" trl vllm-serve --model Qwen/Qwen2.5-72B --tensor_parallel_size 8 &
-
-wait
-```
-
-```python
-import argparse
-
-from datasets import load_dataset
-from trl import GRPOTrainer, GRPOConfig
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--vllm_server_host", type=str, default="", help="The server IP")
-    args = parser.parse_args()
-
-    # Example dataset from TLDR
-    dataset = load_dataset("trl-lib/tldr", split="train")
-
-    # Dummy reward function: count the number of unique characters in the completions
-    def reward_num_unique_chars(completions, **kwargs):
-        return [len(set(c)) for c in completions]
-
-    training_args = GRPOConfig(
-        output_dir="Qwen2.5-72B-GRPO",
-        per_device_train_batch_size=4,
-        bf16=True,
-        gradient_checkpointing=True,
-        logging_steps=10,
-        use_vllm=True,
-        vllm_server_host=args.vllm_server_host.replace("ip-", "").replace("-", "."),  # from ip-X-X-X-X to X.X.X.X
-    )
-
-    trainer = GRPOTrainer(model="Qwen/Qwen2.5-72B", args=training_args, reward_funcs=reward_num_unique_chars, train_dataset=dataset)
-    trainer.train()
-
-if __name__=="__main__":
-    main()
-```
-
-### Using a custom reward function
-
-The [`GRPOTrainer`] supports using custom reward functions instead of dense reward models. To ensure compatibility, your reward function must satisfy the following requirements:
-
-1. **Input arguments**:
-   - The function must accept the following as keyword arguments:
-     - `prompts` (contains the prompts),
-     - `completions` (contains the generated completions),
-     - `completions_ids` (contains the tokenized completions),
-     - All columns names (but `prompt`) that the dataset may have. For example, if the dataset contains a column named `ground_truth`, the function will be called with `ground_truth` as a keyword argument.
-
-     The easiest way to comply with this requirement is to use `**kwargs` in the function signature.
-   - Depending on the dataset format, the input will vary:
-     - For [standard format](dataset_formats#standard), `prompts` and `completions` will be lists of strings.
-     - For [conversational format](dataset_formats#conversational), `prompts` and `completions` will be lists of message dictionaries.
-
-2. **Return value**: The function must return a list of floats. Each float represents the reward corresponding to a single completion.
-
-#### Example 1: Reward longer completions
-
-Below is an example of a reward function for a standard format that rewards longer completions:
-
-```python
-def reward_func(completions_ids, **kwargs):
-    """Reward function that assigns higher scores to longer completions (in terms of token count)."""
-    return [float(len(ids)) for ids in completions_ids]
-```
-
-You can test it as follows:
-
-```python
->>> prompts = ["The sky is", "The sun is"]  # not used in the reward function, but the trainer will pass it
->>> completions = [" blue.", " in the sky."]  # not used in the reward function, but the trainer will pass it
->>> completions_ids = [[6303, 13], [304, 279, 12884, 13]]
->>> reward_func(prompts=prompts, completions=completions, completions_ids=completions_ids)
-[2.0, 4.0]
-```
-
-#### Example 1.1: Reward longer completions (based in the number of characters)
-
-Same as the previous example, but this time the reward function is based on the number of characters instead of tokens.
-
-```python
-def reward_func(completions, **kwargs):
-    """Reward function that assigns higher scores to longer completions (in terms of character count)."""
-    return [float(len(completion)) for completion in completions]
-```
-
-You can test it as follows:
-
-```python
->>> prompts = ["The sky is", "The sun is"]
->>> completions = [" blue.", " in the sky."]
->>> completions_ids = [[6303, 13], [304, 279, 12884, 13]]  # not used in the reward function, but the trainer will pass it
->>> reward_func(prompts=prompts, completions=completions, completions_ids=completions_ids)
-[6.0, 12.0]
-```
-
-#### Example 2: Reward completions with specific format
-
-Below is an example of a reward function that checks if the completion has a specific format. This example is inspired by the _format reward_ function used in the paper [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://huggingface.co/papers/2501.12948).
-It is designed for conversational format, where prompts and completions consist of structured messages.
-
-```python
-import re
-
-def format_reward_func(completions, **kwargs):
-    """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
-    completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content) for content in completion_contents]
-    return [1.0 if match else 0.0 for match in matches]
-```
-
-You can test this function as follows:
-
-```python
->>> prompts = [
-...     [{"role": "assistant", "content": "What is the result of (1 + 2) * 4?"}],
-...     [{"role": "assistant", "content": "What is the result of (3 + 1) * 2?"}],
-... ]
->>> completions = [
-...     [{"role": "assistant", "content": "<think>The sum of 1 and 2 is 3, which we multiply by 4 to get 12.</think><answer>(1 + 2) * 4 = 12</answer>"}],
-...     [{"role": "assistant", "content": "The sum of 3 and 1 is 4, which we multiply by 2 to get 8. So (3 + 1) * 2 = 8."}],
-... ]
->>> format_reward_func(prompts=prompts, completions=completions)
-[1.0, 0.0]
-```
-
-#### Example 3: Reward completions based on a reference
-
-Below is an example of a reward function that checks if the completion is correct. This example is inspired by the _accuracy reward_ function used in the paper [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://huggingface.co/papers/2501.12948).
-This example is designed for [standard format](dataset_formats#standard), where the dataset contains a column named `ground_truth`.
-
-```python
-import re
-
-def reward_func(completions, ground_truth, **kwargs):
-    # Regular expression to capture content inside \boxed{}
-    matches = [re.search(r"\\boxed\{(.*?)\}", completion) for completion in completions]
-    contents = [match.group(1) if match else "" for match in matches]
-    # Reward 1 if the content is the same as the ground truth, 0 otherwise
-    return [1.0 if c == gt else 0.0 for c, gt in zip(contents, ground_truth)]
-```
-
-You can test this function as follows:
-
-```python
->>> prompts = ["Problem: Solve the equation $2x + 3 = 7$. Solution:", "Problem: Solve the equation $3x - 5 = 10$."]
->>> completions = [r" The solution is \boxed{2}.", r" The solution is \boxed{6}."]
->>> ground_truth = ["2", "5"]
->>> reward_func(prompts=prompts, completions=completions, ground_truth=ground_truth)
-[1.0, 0.0]
-```
-#### Example 4: Multi-task reward functions
-
-Below is an example of using multiple reward functions in the [`GRPOTrainer`]. In this example, we define two task-specific reward functions: `math_reward_func` and `coding_reward_func`. The `math_reward_func` rewards math problems based on their correctness, while the `coding_reward_func` rewards coding problems based on whether the solution works.
-
-```python
-from datasets import Dataset
-from trl import GRPOTrainer
-
-# Define a dataset that contains both math and coding problems
-dataset = Dataset.from_list(
-    [
-        {"prompt": "What is 2+2?", "task": "math"},
-        {"prompt": "Write a function that returns the sum of two numbers.", "task": "code"},
-        {"prompt": "What is 3*4?", "task": "math"},
-        {"prompt": "Write a function that returns the product of two numbers.", "task": "code"},
-    ]
-)
-
-# Math-specific reward function
-def math_reward_func(prompts, completions, task, **kwargs):
-    rewards = []
-    for prompt, completion, t in zip(prompts, completions, task):
-        if t == "math":
-            # Calculate math-specific reward
-            correct = check_math_solution(prompt, completion)
-            reward = 1.0 if correct else -1.0
-            rewards.append(reward)
-        else:
-            # Return None for non-math tasks
-            rewards.append(None)
-    return rewards
-
-# Coding-specific reward function
-def coding_reward_func(prompts, completions, task, **kwargs):
-    rewards = []
-    for prompt, completion, t in zip(prompts, completions, task):
-        if t == "coding":
-            # Calculate coding-specific reward
-            works = test_code_solution(prompt, completion)
-            reward = 1.0 if works else -1.0
-            rewards.append(reward)
-        else:
-            # Return None for non-coding tasks
-            rewards.append(None)
-    return rewards
-
-# Use both task-specific reward functions
-trainer = GRPOTrainer(
-    model="Qwen/Qwen2-0.5B-Instruct",
-    reward_funcs=[math_reward_func, coding_reward_func],
-    train_dataset=dataset,
-)
-
-trainer.train()
-```
-
-In this example, the `math_reward_func` and `coding_reward_func` are designed to work with a mixed dataset that contains both math and coding problems. The `task` column in the dataset is used to determine which reward function to apply to each problem. If there is no relevant reward function for a sample in the dataset, the reward function will return `None` and the [`GRPOTrainer`] will continue with the valid functions and tasks. This allows the [`GRPOTrainer`] to handle multiple reward functions with different applicability.
-
-Note that the [`GRPOTrainer`] will ignore the `None` rewards returned by the reward functions and only consider the rewards returned by the relevant functions. This ensures that the model is trained on the relevant tasks and ignores the tasks for which there is no relevant reward function.
-
-
-
-#### Passing the reward function to the trainer
-
-To use your custom reward function, pass it to the [`GRPOTrainer`] as follows:
-
-```python
-from trl import GRPOTrainer
-
-trainer = GRPOTrainer(
-    reward_funcs=reward_func,
-    ...,
-)
-```
-
-If you have multiple reward functions, you can pass them as a list:
-
-```python
-from trl import GRPOTrainer
-
-trainer = GRPOTrainer(
-    reward_funcs=[reward_func1, reward_func2],
-    ...,
-)
-```
-and the reward will be computed as the sum of the rewards from each function, or the weighted sum if `reward_weights` is provided in the config.
-
-Note that [`GRPOTrainer`] supports multiple reward functions of different types. See the parameters documentation for more details.
-
-## GRPOTrainer
-
-[[autodoc]] GRPOTrainer
-
-## GRPOConfig
-
-[[autodoc]] GRPOConfig

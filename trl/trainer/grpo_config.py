@@ -13,11 +13,11 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Optional, Union, Callable
 
 import transformers
 from packaging import version
-from transformers import TrainingArguments
+from transformers.training_args import TrainingArguments
 
 
 @dataclass
@@ -488,6 +488,13 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "Whether to log unique prompts in wandb. If `True`, only unique prompts are logged. If `False`, "
             "all prompts are logged."
+        },
+    )
+    dynamic_prompts_fn: Optional[Callable] = field(
+        default=None,
+        metadata={
+            "help": "用户提供的动态 prompt 调整函数，签名为"
+            "(prompts: List[str], completions: List[str], rewards: List[float], metas: List[dict]) -> List[str]`。"
         },
     )
 
